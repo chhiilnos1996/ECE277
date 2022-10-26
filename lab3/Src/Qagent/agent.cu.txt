@@ -1,0 +1,143 @@
+/*************************************************************************
+/* ECE 277: GPU Programmming 2021 WINTER quarter
+/* Author and Instructer: Cheolhong An
+/* Copyright 2019
+/* University of California, San Diego
+/*************************************************************************/
+#include <cuda_fp16.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <helper_cuda.h>
+#include <helper_functions.h>
+#include <curand.h>
+#include <curand_kernel.h>
+
+#define NUM_AGENTS		128
+
+#define ROWS			32
+#define COLUMNS			32
+#define NUM_ACTIONS		4
+
+#define GAMMA			0.9
+#define ALPHA			0.1
+#define DELTA_EPSILON	0.001
+
+float* d_qtable;
+curandState* d_randstate;
+float epsilon;
+float* d_epsilon;
+short *d_action;
+bool *d_isactive;
+
+__global__ void Qtable_init(float* d_qtable) {
+	int tid = blockIdx.x*blockDim.x + threadIdx.x;
+	d_qtable[tid] = 0;
+}
+
+__global__ void Agent_init(curandState* d_randstate, bool* d_isactive) {
+	int tid = threadIdx.x;
+	curand_init(clock()+tid, tid, 0, &d_randstate[tid]);
+	d_isactive[tid] = 1;
+}
+
+void agent_init()
+{
+	// add your codes
+	//cout << "agent_init()" << endl;
+	epsilon = 1;
+
+	// assign space for d_qtable, d_randstate, d_action, d_isactive, d_epsilon 
+	cudaMalloc((void**)&d_qtable, sizeof(float)*ROWS*COLUMNS * 4);
+	cudaMalloc((void**)&d_randstate, sizeof(curandState)*NUM_AGENTS);
+	cudaMalloc((void**)&d_action, sizeof(short)*NUM_AGENTS);
+	cudaMalloc((void**)&d_isactive, sizeof(bool)*NUM_AGENTS);
+	cudaMalloc((void**)&d_epsilon, sizeof(float));
+
+	Qtable_init << <ROWS*COLUMNS, NUM_ACTIONS >> > (d_qtable);
+	Agent_init << <1, NUM_AGENTS >> > (d_randstate, d_isactive);
+	// not required
+	cudaMemcpy(d_epsilon, &epsilon, sizeof(float), cudaMemcpyHostToDevice);
+}
+
+__global__ void Agent_init_episode(bool* d_isactive) {
+	int tid = threadIdx.x;
+	d_isactive[tid] = 1;
+}
+
+void agent_init_episode() 
+{
+	// add your codes
+	//cout << "agent_init_episode()" << endl;
+	Agent_init_episode << <1, NUM_AGENTS >> > (d_isactive);
+}
+
+float agent_adjustepsilon() 
+{
+	// add your codes
+	//cout << "agent_adjustepsilon()" << endl;
+	if (epsilon > 1.0) {
+		epsilon = 1.0 - DELTA_EPSILON;
+	}
+	else if (epsilon < 0.1) {
+		epsilon = 0.1 + DELTA_EPSILON;
+	}
+	else {
+		epsilon -= DELTA_EPSILON;
+	}
+	cudaMemcpy(d_epsilon, &epsilon, sizeof(float), cudaMemcpyHostToDevice);
+	return epsilon;
+}
+
+__global__ void Agent_action(int2* cstate, float* d_qtable, curandState* d_randstate, short* d_action,  bool* d_isactive, float* d_epsilon) {
+	int tid = threadIdx.x;
+
+	if (d_isactive[tid] == 0) return;
+
+	if (curand_uniform(&d_randstate[tid])<*d_epsilon) {
+		d_action[tid] = ceil(curand_uniform(&d_randstate[tid]) * NUM_ACTIONS) - 1;
+	}
+	else {
+		int idx = NUM_ACTIONS*(COLUMNS*cstate[tid].y+cstate[tid].x);
+		d_action[tid] = 0;
+		for (int i = 1; i < NUM_ACTIONS; i++) {
+			if (d_qtable[idx+i] > d_qtable[idx+d_action[tid]]){
+				d_action[tid] = i;
+			}
+		}
+	}
+}
+short* agent_action(int2* cstate)
+{
+	// add your codes
+	//cout << "agent_action()" << endl;
+	Agent_action << <1, NUM_AGENTS >> > (cstate, d_qtable, d_randstate, d_action, d_isactive, d_epsilon);
+	return d_action;
+}
+
+__global__ void Agent_update(int2* cstate, int2* nstate, float* rewards, float* d_qtable, short* d_action, bool* d_isactive) {
+	int tid = threadIdx.x;
+	if (d_isactive[tid] == 0) return;
+	int c_idx = NUM_ACTIONS * (COLUMNS*cstate[tid].y + cstate[tid].x) + d_action[tid];
+	int n_idx = NUM_ACTIONS * (COLUMNS*nstate[tid].y + nstate[tid].x);
+
+	if (rewards[tid] == 0) {
+		int best_action = 0;
+		for (int i = 1; i < NUM_ACTIONS; i++) {
+			if (d_qtable[n_idx + i] > d_qtable[n_idx + best_action]) {
+				best_action = i;
+			}
+		}
+		d_qtable[c_idx] += ALPHA * (GAMMA*(d_qtable[n_idx + best_action]) - d_qtable[c_idx]);
+	}
+	else {
+		d_qtable[c_idx] += ALPHA * (rewards[tid] - d_qtable[c_idx]);
+		d_isactive[tid] = 0;
+	}
+}
+
+void agent_update(int2* cstate, int2* nstate, float *rewards)
+{
+	// add your codes
+	//cout << "agent_update()" << endl;
+	Agent_update << <1, NUM_AGENTS >> > (cstate, nstate, rewards, d_qtable, d_action, d_isactive);
+}

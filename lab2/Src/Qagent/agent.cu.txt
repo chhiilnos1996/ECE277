@@ -1,0 +1,121 @@
+/*************************************************************************
+/* ECE 277: GPU Programmming 2021 WINTER
+/* Author and Instructer: Cheolhong An
+/* Copyright 2019
+/* University of California, San Diego
+/*************************************************************************/
+#include <cuda_fp16.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <helper_cuda.h>
+#include <helper_functions.h>
+#include <curand.h>
+#include <curand_kernel.h>
+#include <iostream>
+
+#define ROWS			4
+#define COLUMNS			4
+
+#define NUM_ACTIONS		4
+#define NUM_AGENTS		1
+#define GAMMA			0.9
+#define ALPHA			0.1
+#define DELTA_EPSILON	0.001
+
+float epsilon;
+float* d_epsilon;
+short* d_action;
+float* d_qtable;
+curandState* d_randstate;
+
+
+__global__ void Agent_init_kernel(curandState* d_randstate) {
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	curand_init(clock() + tid, tid, 0, &d_randstate[tid]);
+}
+
+__global__ void Qtable_init_kernel(float* d_qtable) {
+	int id = blockIdx.x * blockDim.x + threadIdx.x;
+	d_qtable[id] = 0;
+}
+
+void agent_init()
+{
+	epsilon = 1;
+
+	cudaMalloc((void**)&d_epsilon, sizeof(float));
+	cudaMalloc((void**)&d_action, sizeof(float));
+	cudaMalloc((void**)&d_qtable, sizeof(float)* NUM_ACTIONS * ROWS * COLUMNS);
+	cudaMalloc((void**)&d_randstate, sizeof(curandState)*NUM_AGENTS);
+	
+	Qtable_init_kernel << <COLUMNS*ROWS, NUM_ACTIONS >> > (d_qtable);
+	Agent_init_kernel << <1, 1 >> > (d_randstate);
+
+	cudaMemcpy(d_epsilon, &epsilon, sizeof(float), cudaMemcpyHostToDevice);
+}
+
+
+float agent_adjustepsilon()
+{
+	if (epsilon >= 1.0) {
+		epsilon = 1.0 - DELTA_EPSILON;
+	}
+	else if (epsilon <= 0.1) {
+		epsilon = 0.1 + DELTA_EPSILON;
+	}
+	else {
+		epsilon -= DELTA_EPSILON;
+	}
+	cudaMemcpy(d_epsilon, &epsilon, sizeof(float), cudaMemcpyHostToDevice);
+	return epsilon;
+}
+
+
+__global__ void Agent_action_kernel(int2* cstate, short* d_action, float* d_epsilon, float* d_qtable, curandState* d_randstate) {
+	// choose A from current state S using policy derived from Q (epsilon-greedy)	
+	int agent_id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (curand_uniform(&d_randstate[agent_id]) < *d_epsilon) { // exploration
+		 d_action[agent_id] = (short)(curand_uniform(&d_randstate[agent_id])*NUM_ACTIONS);
+		return;
+	}
+	else { // exploitation
+		int qid = (cstate[agent_id].y * COLUMNS + cstate[agent_id].x) * NUM_ACTIONS;
+		int best_id = qid;
+
+		for (int i = 1; i < NUM_ACTIONS; i++) {
+			if (d_qtable[qid + i] > d_qtable[best_id]) {
+				best_id = qid + i;
+			}
+		}
+
+		d_action[agent_id] = (short)(best_id-qid);
+		return;
+	}
+}
+
+short* agent_action(int2* cstate)
+{
+	Agent_action_kernel << <1, 1 >> > (cstate, d_action, d_epsilon, d_qtable, d_randstate);
+
+	return d_action;
+}
+
+__global__ void Agent_update_kernel(int2* cstate, int2* nstate, float* rewards, float* d_qtable, short* d_action) {
+	// Q(S, A) <- Q(S, A) + alpha[R + gamma * max Q(S', a) - Q(S, A)]
+	int agent_id = blockIdx.x * blockDim.x + threadIdx.x;
+	int n_qid = (nstate[agent_id].y * COLUMNS + nstate[agent_id].x) * NUM_ACTIONS;
+	float max_Q = d_qtable[n_qid];
+	for (short i = 1; i < NUM_ACTIONS; i++) {
+		if (d_qtable[n_qid + i] > max_Q) {
+			max_Q = d_qtable[n_qid + i];
+		}
+	}
+	int c_qid = (cstate[agent_id].y * COLUMNS + cstate[agent_id].x)* NUM_ACTIONS + *d_action;
+	d_qtable[c_qid] += ALPHA * (rewards[agent_id] + GAMMA * max_Q - d_qtable[c_qid]);
+
+}
+
+void agent_update(int2* cstate, int2* nstate, float *rewards)
+{
+	Agent_update_kernel << <1, 1 >> > (cstate, nstate, rewards, d_qtable, d_action);
+}
